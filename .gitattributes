@@ -1,0 +1,5 @@
+# Linux bash cannot parse CRLF shell scripts (as in linux/linux-port).
+*.sh text eol=lf
+# Preserve the existing vendor file's CRLF without a whole-file formatting diff.
+gpu/shadps4/video_core/page_manager.cpp whitespace=cr-at-eol
+gpu/sotc/cpu_patches.h whitespace=cr-at-eol

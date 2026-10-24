@@ -1,0 +1,68 @@
+{
+  "source": "/var/lib/pacman/sync/extra.db (CachyOS/Arch, 2026-10-23)",
+  "packages": [
+    {
+      "name": "boost",
+      "version": "1.92.0-1",
+      "filename": "boost-1.92.0-1-x86_64.pkg.tar.zst",
+      "sha256": "0d795c6401c8bfa16012ada7e2e7f34934fb268f9174470edac1b389056f79bb",
+      "url": "https://archlinux.cachyos.org/repo/extra/os/x86_64/boost-1.92.0-1-x86_64.pkg.tar.zst"
+    },
+    {
+      "name": "cmake",
+      "version": "4.4.4-1",
+      "filename": "cmake-4.4.4-1-x86_64.pkg.tar.zst",
+      "sha256": "d9deb07a41610c2ffc8ab543bdbf033d647015088638e846c0a843ede3631b31",
+      "url": "https://archlinux.cachyos.org/repo/extra/os/x86_64/cmake-4.4.4-1-x86_64.pkg.tar.zst"
+    },
+    {
+      "name": "cppdap",
+      "version": "1.58.0-3",
+      "filename": "cppdap-1.58.0-3-x86_64.pkg.tar.zst",
+      "sha256": "5c8bd9b3881ba9b2bea98eefa95df21d92b026f0c7537105d943857b22388be3",
+      "url": "https://archlinux.cachyos.org/repo/extra/os/x86_64/cppdap-1.58.0-3-x86_64.pkg.tar.zst"
+    },
+    {
+      "name": "ninja",
+      "version": "1.13.2-3",
+      "filename": "ninja-1.13.2-3-x86_64.pkg.tar.zst",
+      "sha256": "19e12c1a169d27e427c3fa678ed3573825ac2a1043c6d47dd96e76ec3d34236c",
+      "url": "https://archlinux.cachyos.org/repo/extra/os/x86_64/ninja-1.13.2-3-x86_64.pkg.tar.zst"
+    },
+    {
+      "name": "rhash",
+      "version": "1.4.6-1",
+      "filename": "rhash-1.4.6-1-x86_64.pkg.tar.zst",
+      "sha256": "6f791b676347898dc72d20cd94be0da2228a26339e6bc511b17f1278d8110706",
+      "url": "https://archlinux.cachyos.org/repo/extra/os/x86_64/rhash-1.4.6-1-x86_64.pkg.tar.zst"
+    },
+    {
+      "name": "robin-map",
+      "version": "1.4.1-1",
+      "filename": "robin-map-1.4.1-1-x86_64.pkg.tar.zst",
+      "sha256": "e4d23dc19b0acf8a8b5117a513454027e22e9b9b1c17ed17d77bcd6dcaf0e103",
+      "url": "https://archlinux.cachyos.org/repo/extra/os/x86_64/robin-map-1.4.1-1-x86_64.pkg.tar.zst"
+    },
+    {
+      "name": "vulkan-headers",
+      "version": "1:1.4.363.0-1",
+      "filename": "vulkan-headers-1:1.4.363.0-1-any.pkg.tar.zst",
+      "sha256": "574e320444b0eac2479f2c3441c6d030176db572bca8a783bf2a67b808a11ebd",
+      "url": "https://archlinux.cachyos.org/repo/extra/os/x86_64/vulkan-headers-1:1.4.363.0-1-any.pkg.tar.zst"
+    },
+    {
+      "name": "zycore-c",
+      "version": "1.5.2-1",
+      "filename": "zycore-c-1.5.2-1-x86_64.pkg.tar.zst",
+      "sha256": "11a520627b1f57337d30859640f3601b3a795d72e68058c5942480a3756f0f85",
+      "url": "https://archlinux.cachyos.org/repo/extra/os/x86_64/zycore-c-1.5.2-1-x86_64.pkg.tar.zst"
+    },
+    {
+      "name": "zydis",
+      "version": "4.1.1-2",
+      "filename": "zydis-4.1.1-2-x86_64.pkg.tar.zst",
+      "sha256": "a96c812827b5aed826893956eac9323d8d983205cd4ba0e0303d5b157e7fbeda",
+      "url": "https://archlinux.cachyos.org/repo/extra/os/x86_64/zydis-4.1.1-2-x86_64.pkg.tar.zst"
+    }
+  ]
+}

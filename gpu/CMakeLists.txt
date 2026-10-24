@@ -1,0 +1,471 @@
+# bbport GPU library: shadPS4 video core + shader recompiler + Gnm/VideoOut
+# drivers, adapted to the native_probe runtime through shims in shim/.
+cmake_minimum_required(VERSION 3.24)
+project(bbgpu LANGUAGES C CXX)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+if (NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo)
+endif()
+# Frame pointers keep the loader's thread dumps (watchdog, SIGUSR2 sampling) walkable.
+add_compile_options(-fno-omit-frame-pointer)
+
+# sotc: one Linux baseline for the loader, runtime, renderer, dependencies and tests.
+# Keep AVX (available on Ivy Bridge), but never require the instructions emulated for guests.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        message(FATAL_ERROR "The native Linux loader requires x86-64")
+    endif()
+    add_compile_options(-march=ivybridge -mno-avx2 -mno-bmi -mno-bmi2 -mno-movbe -mno-lzcnt)
+    # POSIX declarations (e.g. sigjmp_buf) are needed alongside strict -std=c11.
+    add_compile_definitions($<$<COMPILE_LANGUAGE:C>:_DEFAULT_SOURCE>)
+    set(BB_DEFAULT_LTO OFF)
+else()
+    set(BB_DEFAULT_LTO ON)
+endif()
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# bbport: link-time optimization (BB_LTO, default on) and profile-guided optimization
+# (BB_PGO: off, generate = instrumented build writing into BB_PGO_DIR, use = build with that
+# profile). Linux starts without either optimization, using the Ivy Bridge baseline above.
+option(BB_LTO "Link-time optimization of bbgpu" ${BB_DEFAULT_LTO})
+set(BB_PGO "off" CACHE STRING "Profile-guided optimization: off, generate, use")
+set(BB_PGO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pgo" CACHE PATH "Profile directory")
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+if (BB_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT bb_ipo_ok OUTPUT bb_ipo_error)
+    if (bb_ipo_ok)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+    else()
+        message(WARNING "LTO unavailable: ${bb_ipo_error}")
+    endif()
+endif()
+if (BB_PGO STREQUAL "generate" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # sotc: Clang (Windows/MSYS2) instrumentation. Raw profiles go to BB_PGO_DIR/default_<id>.profraw
+    # (%m: every dump of every run merges into the same file); `llvm-profdata merge -o
+    # BB_PGO_DIR/bbgpu.profdata BB_PGO_DIR/*.profraw` makes the profile BB_PGO=use reads.
+    add_compile_options(-fprofile-generate=${BB_PGO_DIR} -fprofile-update=atomic)
+    add_link_options(-fprofile-generate=${BB_PGO_DIR})
+    add_compile_definitions(BB_PGO_GENERATE BB_PGO_CLANG)
+elseif (BB_PGO STREQUAL "use" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Functions changed since the profile was taken are compiled without it (no error).
+    add_compile_options(-fprofile-use=${BB_PGO_DIR}/bbgpu.profdata -Wno-profile-instr-unprofiled
+                        -Wno-profile-instr-out-of-date -Wno-profile-instr-missing
+                        -Wno-backend-plugin)
+elseif (BB_PGO STREQUAL "generate")
+    # Atomic counters: the GPU, recording, preparation and copy threads run the same code.
+    add_compile_options(-fprofile-generate=${BB_PGO_DIR} -fprofile-update=atomic)
+    add_link_options(-fprofile-generate=${BB_PGO_DIR})
+    add_compile_definitions(BB_PGO_GENERATE)
+elseif (BB_PGO STREQUAL "use")
+    # Partial training keeps unprofiled code optimized normally; counters from concurrent
+    # threads can be slightly inconsistent (correction). Functions changed since the profile
+    # (or built differently for it, bbgpu_init) are compiled without it.
+    add_compile_options(-fprofile-use=${BB_PGO_DIR} -fprofile-partial-training
+                        -fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch)
+endif()
+
+find_package(Vulkan REQUIRED)
+find_package(fmt REQUIRED)
+find_package(Boost REQUIRED)
+# bbport (Windows): MSYS2 has no magic_enum/miniz packages; the submodules are used instead.
+find_package(magic_enum QUIET)
+if (NOT magic_enum_FOUND)
+    add_library(magic_enum INTERFACE)
+    add_library(magic_enum::magic_enum ALIAS magic_enum)
+    target_include_directories(magic_enum INTERFACE third_party/magic_enum/include
+                                                    third_party/magic_enum/include/magic_enum)
+endif()
+find_package(tsl-robin-map REQUIRED)
+find_package(VulkanMemoryAllocator CONFIG QUIET)
+if (NOT VulkanMemoryAllocator_FOUND)
+    # MSYS2 ships the header (include/vma/vk_mem_alloc.h) without a CMake package.
+    find_path(VMA_INCLUDE_DIR vk_mem_alloc.h
+        HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../out/deps/vma-3.3.0"
+        PATH_SUFFIXES vma REQUIRED)
+    add_library(VulkanMemoryAllocator INTERFACE)
+    add_library(GPUOpen::VulkanMemoryAllocator ALIAS VulkanMemoryAllocator)
+    target_include_directories(VulkanMemoryAllocator INTERFACE ${VMA_INCLUDE_DIR})
+endif()
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
+pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
+if (NOT WIN32)
+    pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
+endif()
+find_package(miniz QUIET)
+if (NOT miniz_FOUND)
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    add_subdirectory(third_party/miniz EXCLUDE_FROM_ALL)
+    unset(CMAKE_POLICY_VERSION_MINIMUM)
+    add_library(miniz::miniz ALIAS miniz)
+endif()
+find_package(Zydis REQUIRED)
+# sotc: packaged Zydis 4.1 links the unqualified Zycore name, while Zycore 1.5 exports
+# Zycore::Zycore. Resolve that name as a target, including when using a local dependency prefix.
+if (TARGET Zycore::Zycore AND NOT TARGET Zycore)
+    add_library(Zycore ALIAS Zycore::Zycore)
+endif()
+find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
+
+set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
+
+# bbport: FSR 3.1 temporal upscaling / frame generation, native Vulkan (MIT, FireBurn/FSR-Vulkan).
+# sotc: one add_subdirectory for the upscaler and the frame generation (vk_fsrfg.cpp) below.
+set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR3_HOST OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR3_VK_BACKEND OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR3_3_1_5_SCAFFOLD ON CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR4_V07_VULKAN OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
+
+# Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).
+set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/host_shaders)
+set(SHADER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/include)
+set(SHADER_DIR ${SHADER_INCLUDE}/video_core/host_shaders)
+set(SHADER_HEADERS "")
+function(add_host_shader FILENAME SHADER_NAME)
+    set(OUT ${SHADER_DIR}/${SHADER_NAME}.h)
+    string(TOUPPER ${SHADER_NAME} SYMBOL)
+    set(DEFINES ${ARGN})
+    list(TRANSFORM DEFINES PREPEND "-D")
+    add_custom_command(OUTPUT ${OUT}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
+        COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3 -o ${OUT} --vn ${SYMBOL} ${DEFINES} ${SHADER_SRC}/${FILENAME}
+        COMMAND ${CMAKE_COMMAND} "-DHEADER_FILE=${OUT}" -P ${SHADER_SRC}/AddShaderHeaderInclude.cmake
+        DEPENDS ${SHADER_SRC}/${FILENAME} VERBATIM)
+    set(SHADER_HEADERS ${SHADER_HEADERS} ${OUT} PARENT_SCOPE)
+endfunction()
+add_host_shader(color_to_ms_depth.frag color_to_ms_depth_frag)
+add_host_shader(ms_image_blit.frag ms_image_blit_frag)
+add_host_shader(ms_image_blit.frag ms_image_blit_msaa_frag SRC_MSAA=1)
+add_host_shader(fault_buffer_process.comp fault_buffer_process_comp)
+add_host_shader(fs_tri.vert fs_tri_vert)
+add_host_shader(fsr.comp fsr_easu_comp SAMPLE_EASU=1)
+add_host_shader(fsr.comp fsr_rcas_comp SAMPLE_RCAS=1)
+add_host_shader(post_process.frag post_process_frag)
+add_host_shader(shadow_scroll.frag shadow_scroll_frag)
+add_host_shader(fg_depth.comp fg_depth_comp)
+foreach(BPP IN ITEMS 8 16 32 64 96 128)
+    add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
+    add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
+endforeach()
+add_custom_target(host_shaders DEPENDS ${SHADER_HEADERS})
+
+file(GLOB_RECURSE VIDEO_CORE CONFIGURE_DEPENDS shadps4/video_core/*.cpp)
+file(GLOB_RECURSE RECOMPILER CONFIGURE_DEPENDS shadps4/shader_recompiler/*.cpp)
+list(FILTER VIDEO_CORE EXCLUDE REGEX "renderdoc\\.cpp$")
+set(COMMON
+    shadps4/common/decoder.cpp shadps4/common/error.cpp
+    shadps4/common/io_file.cpp shadps4/common/native_clock.cpp shadps4/common/number_utils.cpp
+    shadps4/common/path_util.cpp shadps4/common/rdtsc.cpp shadps4/common/spin_lock.cpp shadps4/common/recursive_lock.cpp
+    shadps4/common/string_util.cpp shadps4/common/thread.cpp shadps4/common/signal_context.cpp
+    shim/common/logging/log.cpp)
+file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp sotc/*.cpp)
+# Windows: a DLL cannot leave the runtime_* symbols for bb-probe.exe to resolve, so the
+# library is static there and linked into the executable.
+if (WIN32)
+    set(BBGPU_KIND STATIC)
+else()
+    set(BBGPU_KIND SHARED)
+endif()
+add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
+    shadps4/core/libraries/gnmdriver/gnmdriver.cpp
+    shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
+    shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
+    shadps4/core/libraries/videodec/video_utils.cpp)
+add_dependencies(bbgpu host_shaders)
+# In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
+# embedded Cyrillic font (third_party/fonts).
+target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
+    third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
+    third_party/imgui/backends/imgui_impl_vulkan.cpp)
+target_include_directories(bbgpu PRIVATE third_party/imgui third_party/imgui/backends)
+target_compile_definitions(bbgpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
+    BB_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
+set_source_files_properties(shim/bbport_overlay.cpp PROPERTIES
+    OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf)
+target_include_directories(bbgpu PRIVATE third_party/stb)
+# DLSS Frame Generation (vk_dlssg.cpp): NVIDIA Streamline SDK headers (MIT); the DLLs are
+# loaded at run time from the executable's folder.
+target_include_directories(bbgpu PRIVATE third_party/streamline/include)
+# AMD FSR 3 frame generation (vk_fsrfg.cpp): the FidelityFX SDK 2.3 frame interpolation and
+# optical flow, natively on Vulkan (third_party/fsr-vulkan, MIT); any GPU with Vulkan 1.3.
+# (fsr-vulkan is added once above, with the frame generation options.)
+target_link_libraries(bbgpu PRIVATE ffx-vulkan::fsr3-vk-framegeneration-3.1.6)
+# The module's 3.1.6 frame generation never starts a frame on its bridge: the constant buffers
+# and descriptor sets of every dispatch are then kept until the context is destroyed (~3 MB of
+# video memory per frame, out of memory within a minute). Its source is built from a copy that
+# starts a bridge frame in RecordPrepare and retires the bridge frames in RetireFrame.
+set(FSR_FG_SRC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr-vulkan/src/ffx_vk_fsr3_3_1_6_framegen.cpp)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${FSR_FG_SRC})
+file(READ ${FSR_FG_SRC} fsr_fg_source)
+string(REPLACE "\r\n" "\n" fsr_fg_source "${fsr_fg_source}")
+set(fsr_fg_patched "${fsr_fg_source}")
+string(REPLACE "    context->frameId = info->frameId;\n"
+    "    context->frameId = info->frameId;\n    ffxVkFsr3_3_1_5BridgeBeginFrame(context->bridge, info->frameId); /* sotc */\n"
+    fsr_fg_patched "${fsr_fg_patched}")
+string(REPLACE [=[
+    return FFX_VK_FSR3_3_1_6_FRAMEGEN_OK;
+}
+
+extern "C" void ffxVkFsr3_3_1_6FrameGenerationContextDestroy(]=] [=[
+    ffxVkFsr3_3_1_5BridgeRetireFrame(context->bridge, completedFrameId); /* sotc */
+    return FFX_VK_FSR3_3_1_6_FRAMEGEN_OK;
+}
+
+extern "C" void ffxVkFsr3_3_1_6FrameGenerationContextDestroy(]=]
+    fsr_fg_patched "${fsr_fg_patched}")
+# Frame generation without the HUD (vk_fsrfg.cpp sets sotc_fsrfg_hudless before RecordPrepare):
+# the HUD-less frame feeds the optical flow and is the interpolation source; FSR 3 then keeps the
+# real frame's pixels where the two differ (the HUD).
+string(REPLACE "#include <vector>\n"
+    "#include <vector>\n/* sotc */ extern \"C\" { FfxVkFsr3_3_1_6FrameGenerationImage sotc_fsrfg_hudless{}; }\nstatic FfxApiResource sotc_hudless_resource{};\n"
+    fsr_fg_patched "${fsr_fg_patched}")
+string(REPLACE [=[
+    flow.color = context->color;
+]=] [=[
+    flow.color = context->color;
+    sotc_hudless_resource = {}; /* sotc */
+    if (sotc_fsrfg_hudless.image != VK_NULL_HANDLE) {
+        const FfxVkFsr3_3_1_5Resource hudless =
+            import_frame_image(context->bridge, sotc_fsrfg_hudless, false);
+        sotc_hudless_resource = ffxVkFsr3_3_1_5BridgeResolveResource(context->bridge, hudless);
+        if (sotc_hudless_resource.resource) {
+            context->pendingImports.push_back(hudless);
+            flow.color = sotc_hudless_resource;
+        } else {
+            ffxVkFsr3_3_1_5BridgeReleaseImportedImage(context->bridge, hudless);
+        }
+    }
+]=] fsr_fg_patched "${fsr_fg_patched}")
+string(REPLACE [=[
+    dispatch.currentBackBuffer = context->color;
+]=] [=[
+    dispatch.currentBackBuffer = context->color;
+    dispatch.currentBackBuffer_HUDLess = sotc_hudless_resource; /* sotc */
+]=] fsr_fg_patched "${fsr_fg_patched}")
+string(REGEX MATCHALL "/\\* sotc \\*/" fsr_fg_marks "${fsr_fg_patched}")
+list(LENGTH fsr_fg_marks fsr_fg_mark_count)
+if (NOT fsr_fg_mark_count EQUAL 5)
+    message(FATAL_ERROR "fsr-vulkan changed: update the frame generation fix in gpu/CMakeLists.txt")
+endif()
+set(FSR_FG_PATCHED ${CMAKE_CURRENT_BINARY_DIR}/sotc_fsr3_framegen.cpp)
+if (EXISTS ${FSR_FG_PATCHED})
+    file(READ ${FSR_FG_PATCHED} fsr_fg_existing)
+endif()
+if (NOT "${fsr_fg_existing}" STREQUAL "${fsr_fg_patched}")
+    file(WRITE ${FSR_FG_PATCHED} "${fsr_fg_patched}")
+endif()
+get_target_property(fsr_fg_sources ffx_vulkan_fsr3_vk_framegeneration_3_1_6 SOURCES)
+list(LENGTH fsr_fg_sources fsr_fg_count)
+list(REMOVE_ITEM fsr_fg_sources src/ffx_vk_fsr3_3_1_6_framegen.cpp)
+list(LENGTH fsr_fg_sources fsr_fg_count_after)
+if (fsr_fg_count EQUAL fsr_fg_count_after)
+    message(FATAL_ERROR "fsr-vulkan: ffx_vk_fsr3_3_1_6_framegen.cpp not in its target")
+endif()
+list(APPEND fsr_fg_sources ${FSR_FG_PATCHED})
+set_property(TARGET ffx_vulkan_fsr3_vk_framegeneration_3_1_6 PROPERTY SOURCES ${fsr_fg_sources})
+target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
+target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
+target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
+# Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
+if (NOT WIN32)
+    target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
+endif()
+target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
+    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+target_include_directories(bbgpu PRIVATE third_party/xbyak)
+if (WIN32)
+    # Guest code is entered with the System V ABI; NOMINMAX/WIN32_LEAN_AND_MEAN keep
+    # <windows.h> out of the way of std::min/max and the Vulkan/SDL headers.
+    target_compile_definitions(bbgpu PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(bbgpu PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/bb_win_compat.h)
+    target_link_libraries(bbgpu PUBLIC Vulkan::Vulkan ws2_32 bcrypt ntdll synchronization winmm)
+else()
+    target_link_libraries(bbgpu PUBLIC PkgConfig::X11)
+endif()
+
+# bbport (Windows): bbgpu is a static library there, so the loader and the HLE runtime are
+# linked here, where CMake knows its dependencies (build.sh builds them with ninja).
+if (WIN32)
+    enable_language(RC)
+    file(GLOB BB_RUNTIME CONFIGURE_DEPENDS ../src/runtime*.c)
+    file(GLOB BB_ATRAC9 CONFIGURE_DEPENDS ../third_party/LibAtrac9/C/src/*.c)
+    add_library(atrac9 STATIC ${BB_ATRAC9})
+    target_compile_options(atrac9 PRIVATE -w)
+    set_target_properties(atrac9 PROPERTIES C_STANDARD 99 INTERPROCEDURAL_OPTIMIZATION OFF)
+    add_executable(bb-probe ../src/probe.c ${BB_RUNTIME} ../src/compat_win.c ../src/vulkan_smoke.c
+        ../packaging/windows/bb-probe.rc)
+    set_target_properties(bb-probe PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(bb-probe PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Werror>)
+    target_include_directories(bb-probe PRIVATE .. ../src)
+    target_link_libraries(bb-probe PRIVATE bbgpu atrac9 onecore bcrypt ws2_32 winmm -pthread)
+    # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
+    # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
+    target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
+    add_executable(bb-gpu-capabilities ../tools/gpu_capabilities.c ../packaging/windows/bb-gpu-capabilities.rc)
+    target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan)
+endif()
+
+# sotc: CMake owns the complete native Linux build, including C flags and runtime exports.
+# The object library includes every runtime service needed by libbbgpu.so in each host executable.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(Threads REQUIRED)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    file(GLOB BB_RUNTIME CONFIGURE_DEPENDS ../src/runtime*.c)
+    file(GLOB BB_ATRAC9 CONFIGURE_DEPENDS ../third_party/LibAtrac9/C/src/*.c)
+    add_library(atrac9 STATIC ${BB_ATRAC9})
+    set_target_properties(atrac9 PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF)
+    target_compile_options(atrac9 PRIVATE -w)
+
+    add_library(bb-runtime OBJECT ${BB_RUNTIME})
+    set_target_properties(bb-runtime PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_include_directories(bb-runtime PUBLIC .. ../src)
+    target_compile_options(bb-runtime PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(bb-runtime PUBLIC bbgpu atrac9 Threads::Threads ${CMAKE_DL_LIBS} m)
+
+    add_executable(bb-probe ../src/probe.c ../src/vulkan_smoke.c)
+    set_target_properties(bb-probe PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF
+        POSITION_INDEPENDENT_CODE OFF ENABLE_EXPORTS ON
+        BUILD_RPATH "$ORIGIN;$ORIGIN/gpu" BUILD_RPATH_USE_ORIGIN ON)
+    target_compile_options(bb-probe PRIVATE -Wall -Wextra -Werror)
+    target_link_options(bb-probe PRIVATE -no-pie)
+    target_link_libraries(bb-probe PRIVATE bb-runtime Vulkan::Vulkan)
+
+    add_executable(bb-gpu-capabilities ../tools/gpu_capabilities.c)
+    set_target_properties(bb-gpu-capabilities PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(bb-gpu-capabilities PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan)
+
+    enable_testing()
+    add_test(NAME ivybridge-build COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_linux_build.py
+        ${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json)
+    add_test(NAME linux-launcher COMMAND ${Python3_EXECUTABLE} -m unittest discover
+        -s ${CMAKE_CURRENT_SOURCE_DIR}/../tests -p test_linux_launcher.py -v)
+    add_test(NAME native-play COMMAND ${Python3_EXECUTABLE} -m unittest discover
+        -s ${CMAKE_CURRENT_SOURCE_DIR}/../tests -p test_native_play.py -v)
+    set_tests_properties(native-play PROPERTIES TIMEOUT 30)
+    add_test(NAME linux-deadline COMMAND ${Python3_EXECUTABLE} -m unittest discover
+        -s ${CMAKE_CURRENT_SOURCE_DIR}/../tests -p test_linux_deadline.py -v)
+    set_tests_properties(linux-deadline PROPERTIES TIMEOUT 30)
+    set_tests_properties(ivybridge-build linux-launcher PROPERTIES TIMEOUT 30)
+    foreach(test IN ITEMS pad file-mods content runtime sema savedata)
+        string(REPLACE "-" "_" source "${test}")
+        add_executable(${test}-test EXCLUDE_FROM_ALL ../tests/test_${source}.c)
+        set_target_properties(${test}-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+        target_include_directories(${test}-test PRIVATE .. ../src)
+        target_compile_options(${test}-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+        if (test STREQUAL "runtime" OR test STREQUAL "sema")
+            target_sources(${test}-test PRIVATE ../tests/test_runtime_host.c)
+            target_link_libraries(${test}-test PRIVATE bb-runtime)
+            set_target_properties(${test}-test PROPERTIES ENABLE_EXPORTS ON)
+        elseif (test STREQUAL "content")
+            target_sources(${test}-test PRIVATE ../src/runtime_content.c)
+        elseif (test STREQUAL "pad")
+            target_sources(${test}-test PRIVATE ../src/runtime_event.c)
+            target_link_libraries(${test}-test PRIVATE PkgConfig::SDL3 Threads::Threads)
+        elseif (test STREQUAL "file-mods")
+            target_sources(${test}-test PRIVATE ../src/runtime_event.c)
+            target_link_libraries(${test}-test PRIVATE Threads::Threads)
+        elseif (test STREQUAL "savedata")
+            target_sources(${test}-test PRIVATE ../src/runtime_file.c ../src/runtime_event.c)
+            target_link_libraries(${test}-test PRIVATE Threads::Threads)
+        endif()
+        add_test(NAME ${test} COMMAND ${test}-test)
+        set_tests_properties(${test} PROPERTIES TIMEOUT 30)
+    endforeach()
+endif()
+
+# Explicit test targets; neither launches the game nor needs a Vulkan device.
+add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
+target_compile_options(motion-history-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(motion-history-test PRIVATE ..)
+add_executable(motion-shader-test EXCLUDE_FROM_ALL ../tests/test_motion_shaders.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(motion-shader-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(motion-shader-test PRIVATE bbgpu)
+add_executable(ui-composition-test EXCLUDE_FROM_ALL ../tests/test_ui_composition.cpp)
+target_compile_options(ui-composition-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(ui-composition-test PRIVATE ..)
+
+add_executable(scene-resolution-test EXCLUDE_FROM_ALL ../tests/test_scene_resolution.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(scene-resolution-test PRIVATE shim shadps4 third_party/gcn/include)
+# The test's Vulkan-Hpp inline methods have a different set of platform extensions
+# from vk_platform.cpp. Keep them local and use an explicit dispatcher in the test.
+target_compile_options(scene-resolution-test PRIVATE -UNDEBUG -fPIC)
+set_source_files_properties(../tests/test_scene_resolution.cpp PROPERTIES
+    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+target_link_libraries(scene-resolution-test PRIVATE bbgpu)
+add_executable(taa-shader-test EXCLUDE_FROM_ALL ../tests/test_taa_shader.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(taa-shader-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
+target_compile_options(taa-shader-test PRIVATE -UNDEBUG -fPIC)
+set_source_files_properties(../tests/test_taa_shader.cpp PROPERTIES
+    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+target_link_libraries(taa-shader-test PRIVATE bbgpu)
+add_dependencies(taa-shader-test host_shaders)
+
+add_executable(camera-motion-test EXCLUDE_FROM_ALL ../tests/test_camera_motion.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
+target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(camera-motion-test PRIVATE bbgpu)
+add_dependencies(camera-motion-test host_shaders)
+
+add_executable(barycentric-gs-test EXCLUDE_FROM_ALL ../tests/test_barycentric_gs.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(barycentric-gs-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(barycentric-gs-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(barycentric-gs-test PRIVATE bbgpu)
+
+# sotc: BMI1/LZCNT/MOVBE/SSE4a emulation against scalar software, safe on Ivy Bridge.
+add_executable(cpu-emulation-test EXCLUDE_FROM_ALL ../tests/test_cpu_emulation.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(cpu-emulation-test PRIVATE shadps4 sotc third_party/xbyak)
+target_compile_options(cpu-emulation-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_link_libraries(cpu-emulation-test PRIVATE bbgpu)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set_target_properties(cpu-emulation-test PROPERTIES ENABLE_EXPORTS ON)
+    add_test(NAME cpu-emulation COMMAND cpu-emulation-test)
+    set_tests_properties(cpu-emulation PROPERTIES TIMEOUT 180)
+endif()
+
+add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
+    shim/bbport_settings.cpp)
+target_include_directories(upscaler-support-test PRIVATE shim)
+target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME upscaler-support COMMAND upscaler-support-test)
+    set_tests_properties(upscaler-support PROPERTIES TIMEOUT 30)
+endif()
+
+# sotc: portable scanner decoding, with no renderer, runtime or host exception dependency.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(linux-cpu-boot-test EXCLUDE_FROM_ALL ../tests/test_linux_cpu_boot.cpp
+        ../tests/test_gpu_runtime_stubs.cpp ../src/runtime_signal.c)
+    target_include_directories(linux-cpu-boot-test PRIVATE shadps4 sotc third_party/xbyak)
+    target_compile_options(linux-cpu-boot-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    set_target_properties(linux-cpu-boot-test PROPERTIES ENABLE_EXPORTS ON)
+    target_link_libraries(linux-cpu-boot-test PRIVATE bbgpu Threads::Threads)
+    add_test(NAME linux-cpu-boot COMMAND linux-cpu-boot-test)
+    set_tests_properties(linux-cpu-boot PROPERTIES TIMEOUT 30)
+endif()
+add_executable(cpu-patch-decode-test EXCLUDE_FROM_ALL ../tests/test_cpu_patch_decode.cpp
+    sotc/cpu_patch_decode.cpp shadps4/common/decoder.cpp)
+target_include_directories(cpu-patch-decode-test PRIVATE shadps4 sotc)
+target_compile_options(cpu-patch-decode-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_link_libraries(cpu-patch-decode-test PRIVATE Zydis::Zydis fmt::fmt)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME cpu-patch-decode COMMAND cpu-patch-decode-test)
+    set_tests_properties(cpu-patch-decode PROPERTIES TIMEOUT 30)
+endif()
+
